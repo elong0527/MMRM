@@ -1,0 +1,183 @@
+---
+title: 'Mixed effect Model Repeat Measurement (MMRM)'
+author: "Yilong Zhang"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapsed: yes
+  flexdashboard::flex_dashboard:
+    vertical_layout: fill
+  html_notebook:
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapsed: yes
+---
+
+# Summary
+
+MMRM is commonly used in clinical trials with longitudinal outcome. This page is to illustrate how to fit Mixed effect Model Repeat Measurement (MMRM) in R. 
+
+### Reference
+
+* Siddiqui, O., Hung, H. J., & O'Neill, R. (2009). MMRM vs. LOCF: a comprehensive comparison based on simulation study and 25 NDA datasets. Journal of biopharmaceutical statistics, 19(2), 227-246.
+* Mallinckrodt, C. H., Clark, W. S., & David, S. R. (2001). Accounting for dropout bias using mixed-effects models. Journal of biopharmaceutical statistics, 11(1-2), 9-21.
+* https://www.slideshare.net/Medresearch/recommendations-for-the-primary-analysis-of-continuous-endpoints
+* http://www.biostat.jhsph.edu/~iruczins/teaching/jf/ch5.pdf
+* https://stat.ethz.ch/pipermail/r-sig-mixed-models/2015q1/023168.html
+* http://www.ics.uci.edu/~staceyah/112-203/R/Stats112-203-RFunctions.R
+
+
+### Load Function
+```{r}
+library(mvtnorm)
+library(nlme)
+library(dplyr)
+library(reshape2)
+library(lsmeans)
+```
+
+```{r}
+VarCov_gls <- function(fit){
+  vars <- coef(fit$modelStruct$varStruct, uncons = FALSE, allCoef = TRUE)^2 * fit$sigma^2
+  r = coef(fit$modelStruct$corStruct, uncons = FALSE, allCoef = TRUE)
+  cors = matrix(NA, ncol = length(vars), nrow = length(vars))
+	cors[lower.tri(cors)] = r
+	cors[upper.tri(cors)] = t(cors)[upper.tri(t(cors))]
+	diag(cors) = rep(1, length(vars))
+  
+  covs <- diag(sqrt(vars) ) %*% cors %*% diag(sqrt(vars))
+  rownames(covs) <- names(vars)
+  colnames(covs) <- names(vars)
+  covs
+}
+```
+
+### Set up
+```{r}
+n   <- 100
+
+trt <- c(0, 1.3, 2.3, 3.2, 4)
+plc <- c(0, 1.0, 1.8, 2.5, 3)
+sd  <- c(2.0, 1.8, 2.0, 2.1, 2.2)
+
+corr <- cor   <- matrix(
+  c(1, 0.6, 0.3, 0.2, 0.1, 
+    0.6, 1, 0.7, 0.5, 0.2, 
+    0.3, 0.7, 1, 0.6, 0.4,
+    0.2, 0.5, 0.6, 1, 0.5,
+    0.1, 0.2, 0.4, 0.5, 1), 5,5)
+cov <- diag(sd) %*% cor %*% diag(sd)
+```
+
+### Data Simulation
+```{r}
+set.seed(123)
+y_trt <- rmvnorm(n, mean = trt, sigma = cov)
+y_plc <- rmvnorm(n, mean = plc, sigma = cov)
+Y <- rbind(y_trt, y_plc)
+grp <- rep(1:0, each = n)
+db  <- data.frame(id = 1:nrow(Y), Y, grp)
+names(db) <- c("id","basval","y1","y2","y3","y4","trt")
+db_chg <- db %>% mutate(y1 = y1 - basval,
+                        y2 = y2 - basval,
+                        y3 = y3 - basval,
+                        y4 = y4 - basval)
+db_chg_long <- melt(db_chg, id.vars = c("id","basval", "trt"), variable.name = "time")
+write.csv(db_chg_long, "db_chg_long.csv")
+```
+
+
+## Full Data Analysis
+
+### Fit ANCOVA for linear model
+```{r}
+summary(lm( y4 ~ basval + trt, data = db_chg))
+```
+
+### MMRM
+
+* ANCOVA and MMRM provide same results when data is completed
+* The result for MMRM is equivalent to the SAS code in both completed data and missing data.
+* For complete data, the power to compare end timepoint treatment difference should be similar for MMRM and ANCOVA
+
+```
+%macro import_csv(data,file);
+PROC IMPORT OUT= &data 
+            DATAFILE= "&file"
+            DBMS=CSV REPLACE;
+     GETNAMES=YES;
+     DATAROW=2; 
+RUN;
+%mend import_csv;
+
+%import_csv(tmp, &path\db_chg_long.csv);
+
+proc mixed data=tmp ;
+   class trt time id;
+   model value= time basval*time trt*time / cl;
+   repeated time/type=un subject=id;
+   lsmeans time trt*time/cl pdiff;
+run;
+```
+
+Model Fitting Summary 
+```{r}
+fit <- nlme:::gls(value ~ relevel(time, ref = "y4") + 
+                          basval:relevel(time, ref = "y4") + 
+                          factor(trt, levels = c(1,0)): relevel(time, ref = "y4"), 
+                   correlation = corSymm( form = ~ 1 | id), 
+                   weights = varIdent(form = ~ 1 | time),
+                   data = db_chg_long)
+fit
+```
+
+LS means results
+```{r}
+## Note that the degree of freedom is wrong in GLS. 
+lsmeans(fit, list(pairwise ~ time*trt), df=nrow(db) - 1, adjust = NULL )
+```
+
+Variance Covariance Matrix
+```{r}
+VarCov_gls(fit)
+```
+
+
+## Missing Data Analysis
+
+### Assign Missing Value
+```{r}
+db_chg_missing <- db
+db_chg_missing[c(1:10, n + 1:10), c(3:5)] <- NA
+db_chg_missing_long <- melt(db_chg_missing, id.vars = c("id","basval", "trt"), variable.name = "time")
+db_chg_missing_long <- na.omit(db_chg_missing_long)
+write.csv(db_chg_missing_long, "db_chg_missing_long.csv")
+```
+
+Model Fitting Summary 
+```{r}
+fit <- nlme:::gls(value ~ relevel(time, ref = "y4") + 
+                          basval:relevel(time, ref = "y4") + 
+                          factor(trt, levels = c(1,0)): relevel(time, ref = "y4"), 
+                   correlation = corSymm( form = ~ 1 | id), 
+                   weights = varIdent(form = ~ 1 | time),
+                   data = db_chg_missing_long)
+fit
+```
+
+LS means results
+```{r}
+## Note that the degree of freedom is wrong in GLS. 
+lsmeans(fit, list(pairwise ~ time*trt), df=nrow(db) - 1, adjust = NULL )
+```
+
+Variance Covariance Matrix
+```{r}
+VarCov_gls(fit)[c(2:4,1), c(2:4,1)]
+```
+
+
